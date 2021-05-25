@@ -1,0 +1,1097 @@
+---
+title: "Logistic versus linear regression-based Reliable Change Index: Implications for clinical studies with diverse sample sizes"
+author:
+  - Rafael A. Moral
+  - Unai Diaz-Orueta
+  - Javier Oltra-Cucarella
+date: "Code to reproduce the results in the paper"
+output: 
+  html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(hnp)
+library(lme4)
+library(gt)
+library(gamlss)
+library(glmmTMB)
+
+adni <- readxl::read_xlsx("adni.xlsx")
+adni$AGE <- as.numeric(adni$AGE)
+adni$PTEDUCAT <- as.numeric(adni$PTEDUCAT)
+adni$AVLT_DEL_BL <- as.numeric(adni$AVLT_DEL_BL)
+adni$AVLT_DEL_6M <- as.numeric(adni$AVLT_DEL_6M)
+
+adni <- adni %>%
+  dplyr::select(AGE, PTEDUCAT, PTGENDER, AVLT_DEL_6M, AVLT_DEL_BL)
+
+adni <- adni %>%
+  filter(AVLT_DEL_6M > 0 & AVLT_DEL_BL > 0)
+
+names(adni) <- c("age","education","gender","score","baseline")
+adni$gender <- as.factor(adni$gender)
+levels(adni$gender) <- c("male","female") ## assuming 0 = male and 1 = female
+
+adni <- adni %>%
+  mutate(education_level = cut(education, breaks = c(4,8,12,16,20.1), right = FALSE, labels = c("4 to 7 years","8 to 11 years","12 to 15 years","16 to 20 years")))
+
+adni$ID <- 1:nrow(adni)
+```
+
+```{r, echo = FALSE}
+## incomplete beta function
+ibeta <- Vectorize(function(x, a = 2/3, b = 2/3) {
+  pbeta(x, a, b) * beta(a, b)
+}, "x")
+
+## Logistic-RCI
+RCI_binomial <- function(obj) {
+  X <- model.matrix(obj)
+  disp <- summary(obj)$dispersion
+  beta <- coef(obj)
+  m <- obj$prior.weights
+  p <- obj$y
+  p_hat <- plogis(as.numeric(X %*% beta))
+  numerator <- ibeta(p) - ibeta(p_hat - (1 - 2 * p_hat)/(6 * m))
+  denominator <- (p_hat * (1 - p_hat))^(-1/6)
+  score <- sqrt(m) * numerator/denominator
+  return(score)
+}
+
+## Linear-RCI
+RCI_linear <- function(obj) {
+  m <- model.matrix(obj)
+  numerator <- residuals(obj, type = "response")
+  sigma <- summary(obj)$sigma
+  #h <- diag(m %*% solve(crossprod(m,m)) %*% t(m))
+  h <- influence(obj)$h
+  denominator <- sigma
+  score <- numerator/denominator
+  return(score)
+}
+
+RCI <- function(obj) {
+  if(class(obj)[1] == "glm") {
+    return(RCI_binomial(obj))
+  } else {
+    return(RCI_linear(obj))
+  }
+}
+```
+
+## Simulation study
+
+Here we carry out a simulation study using a simulated target population of 1 million individuals. We begin by fitting a linear and a logistic model to the ADNI dataset including baseline score, age, education and gender, and treat the estimated parameters as the true population parameters. Then, we simulate a population of 1 million individuals based on these estimated parameters and predefined distributions for baseline score, age, education and gender that are similar to the ones observed in the ADNI dataset. Finally, we draw 1000 samples of size 10, 20, 30, 40, 50, 100, 150, 200, 250, 500, 750 and 1000 from the simulated dataset and re-fit these models. We assess
+
+- the significance of the effects in the linear predictor
+- the normality of the regression based RCI (based on the Shapiro-Wilk test)
+- the percentage of points outside the envelope of the half-normal plot of the residuals
+- the number of individuals for which reliable change is detected
+- the overlap between reliable change detected using linear vs. logistic regression
+- the percentage coverage of the 90\%, 95\% and 99\% CI for each true parameter value
+
+We start by fitting the models to the ADNI dataset:
+
+```{r}
+fit_linear <- lm(score ~ baseline + age + education + gender, data = adni)
+fit_logistic <- glm(cbind(score, 15 - score) ~ baseline + age + education + gender, family = quasibinomial, data = adni)
+```
+
+The ANOVA table for the linear regression model:
+```{r}
+anova(fit_linear)
+```
+
+The analysis of deviance table for the logistic regression model:
+```{r}
+anova(fit_logistic, test = "F")
+```
+
+These are the target parameter values for the linear regression model:
+```{r}
+lin_coef <- coef(fit_linear)
+lin_coef
+```
+
+These are the target parameter values for the logistic regression model:
+```{r}
+logis_coef <- coef(fit_logistic)
+logis_coef
+```
+
+We now simulate 1 million individuals based on each model. This is the simulated distribution of age. It is based on a normal distribution with the mean equal to the mean age in the ADNI dataset and variance equal to the variance of the age in the ADNI dataset.
+
+```{r}
+set.seed(2021)
+sim_age <- rnorm(1e6, mean(adni$age), sd(adni$age)) %>% round(1)
+hist(sim_age, prob = TRUE); curve(dnorm(x, mean(adni$age), sd(adni$age)), add = TRUE)
+```
+
+This is the simulated distribution of baseline scores. It was obtained by fitting a beta distribution to 15 minus the baseline scores in the ADNI dataset.
+
+```{r}
+xb <- mean((15 - adni$baseline)/15)
+x2b <- mean(((15 - adni$baseline)/15)^2)
+s2 <- x2b - xb^2
+a <- xb * (xb * (1 - xb)/s2 - 1)
+b <- (1 - xb) * (xb * (1 - xb)/s2 - 1)
+
+set.seed(2021)
+sim_baseline <- (rbeta(1e6, a, b) * 15) %>% round(0)
+hist(sim_baseline, prob = TRUE)
+```
+
+In the ADNI dataset there are 54\% of males and 46\% of females, however we used a 50:50 split for the simulated gender.
+
+```{r}
+set.seed(2021)
+sim_gender <- rbinom(1e6, 1, .5)
+sim_gender <- ifelse(sim_gender == 0, "male", "female") %>% as.factor
+sim_gender <- relevel(sim_gender, ref = "male")
+table(sim_gender)
+```
+
+Finally for the education variable we assume a discrete uniform distribution over the range 4 to 20.
+
+```{r}
+set.seed(2021)
+sim_education <- runif(1e6, 3.51, 20.49) %>% round(0)
+table(sim_education)
+```
+
+```{r, echo = FALSE}
+## simulating scores
+X <- model.matrix(~ sim_baseline + sim_age + sim_education + sim_gender)
+sim_prob <- plogis(X %*% logis_coef) %>% as.numeric
+
+set.seed(2021)
+sim_score <- rbinom(1e6, 15, sim_prob)
+
+sim_data <- tibble(score = sim_score,
+                   baseline = sim_baseline,
+                   age = sim_age,
+                   education = sim_education,
+                   gender = sim_gender,
+                   ID = 1:1e6)
+
+## fitting models to simulated data
+fit_linear_sim <- lm(score ~ baseline + age + education + gender, data = sim_data)
+fit_logistic_sim <- glm(cbind(score, 15 - score) ~ baseline + age + education + gender, family = quasibinomial, data = sim_data)
+
+## updating true coefficients
+lin_coef <- coef(fit_linear_sim)
+logis_coef <- coef(fit_logistic_sim)
+
+## obtaining "true" RC points
+true_rci_lin <- RCI(fit_linear_sim)
+true_rci_logis <- RCI(fit_logistic_sim)
+
+true_rci_lin_id <- which(true_rci_lin < -1.64) %>% as.numeric
+true_rci_logis_id <- which(true_rci_logis < -1.64) %>% as.numeric
+```
+
+## Results
+
+```{r, echo = FALSE}
+## function to get standard error of estimates in fitted model
+get_se <- function(obj) {
+  return(summary(obj)$coefficients[,2])
+}
+
+## function to obtain random rample
+sample_adni <- function(n, data = sim_data) {
+  rows <- sample(1:nrow(data), n)
+  adni_sample <- data[rows,]
+  n_unique <- apply(adni_sample, 2, function(x) length(unique(x)))
+  while(any(n_unique == 1)) {
+    rows <- sample(1:nrow(data), n)
+    adni_sample <- data[rows,]
+    n_unique <- apply(adni_sample, 2, function(x) length(unique(x)))
+  }
+  return(adni_sample)
+}
+
+## function to fit both models
+fit_both <- function(data) {
+  lin <- lm(score ~ baseline + age + education + gender, data = data)
+  logis <- glm(cbind(score, 15 - score) ~ baseline + age + education + gender, family = quasibinomial, data = data)
+  return(list("lin" = lin,
+              "logis" = logis))
+}
+
+## function to check significance of effects
+signif <- function(fit) {
+  F_lin <- anova(fit$lin)$`Pr(>F)` %>% na.omit %>% as.numeric
+  F_logis <- anova(fit$logis, test = "F")$`Pr(>F)` %>% na.omit %>% as.numeric
+  return(list("lin" = F_lin < 0.05,
+              "logis" = F_logis < 0.05))
+}
+
+## function to check normality of RCI, how many points detected, and overlap
+rci_stats <- function(fit, true_rci = list("lin" = true_rci_lin_id,
+                                           "logis" = true_rci_logis_id),
+                      the_quantile = qnorm(0.05)) {
+  rci_lin <- RCI(fit$lin)
+  rci_logis <- RCI(fit$logis)
+  norm_lin <- shapiro.test(rci_lin)$p.value
+  norm_logis <- shapiro.test(rci_logis)$p.value
+  
+  n_lin <- sum(rci_lin <= the_quantile)
+  n_logis <- sum(rci_logis <= the_quantile)
+  n_overlap <- sum(n_lin == n_logis)
+  
+  n_expected_lin <- sum(fit$logis$data$ID %in% true_rci_lin_id)
+  n_expected_logis <- sum(fit$logis$data$ID %in% true_rci_logis_id)
+  n_correct_lin <- sum(fit$logis$data$ID[which(rci_lin <= the_quantile)] %in% true_rci_lin_id)
+  n_correct_logis <- sum(fit$logis$data$ID[which(rci_logis <= the_quantile)] %in% true_rci_logis_id)
+  
+  all_ID <- data.frame(ID = fit$logis$data$ID)
+  
+  all_ID$true_rci_lin <- all_ID$ID %in% true_rci_lin_id
+  all_ID$true_rci_lin <- as.factor(all_ID$true_rci_lin)
+  levels(all_ID$true_rci_lin) <- c("FALSE","TRUE")
+  
+  all_ID$pred_rci_lin <- rci_lin <= the_quantile
+  all_ID$pred_rci_lin <- as.factor(all_ID$pred_rci_lin)
+  levels(all_ID$pred_rci_lin) <- c("FALSE","TRUE")
+  
+  all_ID$true_rci_logis <- all_ID$ID %in% true_rci_logis_id
+  all_ID$true_rci_logis <- as.factor(all_ID$true_rci_logis)
+  levels(all_ID$true_rci_logis) <- c("FALSE","TRUE")
+  
+  all_ID$pred_rci_logis <- rci_logis <= the_quantile
+  all_ID$pred_rci_logis <- as.factor(all_ID$pred_rci_logis)
+  levels(all_ID$pred_rci_logis) <- c("FALSE","TRUE")
+  
+  conf_lin <- with(all_ID, table(pred_rci_lin, true_rci_lin))
+  conf_logis <- with(all_ID, table(pred_rci_logis, true_rci_logis))
+  
+  TPR_lin <- conf_lin[2,2]/colSums(conf_lin)[2] %>% as.numeric
+  if(colSums(conf_lin)[2] == 0) TPR_lin <- 1
+  TNR_lin <- conf_lin[1,1]/colSums(conf_lin)[1] %>% as.numeric
+  if(colSums(conf_lin)[1] == 0) TNR_lin <- 0
+  FNR_lin <- 1 - TPR_lin
+  FPR_lin <- 1 - TNR_lin
+  acc_lin <- sum(diag(conf_lin))/sum(conf_lin) %>% as.numeric
+  
+  TPR_logis <- conf_logis[2,2]/colSums(conf_logis)[2] %>% as.numeric
+  if(colSums(conf_logis)[2] == 0) TPR_logis <- 1
+  TNR_logis <- conf_logis[1,1]/colSums(conf_logis)[1] %>% as.numeric
+  if(colSums(conf_logis)[1] == 0) TNR_logis <- 0
+  FNR_logis <- 1 - TPR_logis
+  FPR_logis <- 1 - TNR_logis
+  acc_logis <- sum(diag(conf_logis))/sum(conf_logis) %>% as.numeric
+  
+  return(list("norm_lin" = norm_lin < 0.05,
+              "norm_logis" = norm_logis < 0.05,
+              "n_lin" = n_lin,
+              "n_logis" = n_logis,
+              "n_overlap" = n_overlap,
+              "n_expected_lin" = n_expected_lin,
+              "n_expected_logis" = n_expected_logis,
+              "n_correct_lin" = n_correct_lin,
+              "n_correct_logis" = n_correct_logis,
+              "TPR_lin" = TPR_lin,
+              "TNR_lin" = TNR_lin,
+              "FPR_lin" = FPR_lin,
+              "FNR_lin" = FNR_lin,
+              "TPR_logis" = TPR_logis,
+              "TNR_logis" = TNR_logis,
+              "FPR_logis" = FPR_logis,
+              "FNR_logis" = FNR_logis,
+              "acc_lin" = acc_lin,
+              "acc_logis" = acc_logis))
+}
+
+rci_hnp_stats <- function(fit, true_rci = list("lin" = true_rci_lin_id,
+                                           "logis" = true_rci_logis_id)) {
+  rci_lin <- RCI(fit$lin)
+  rci_logis <- RCI(fit$logis)
+  
+  norm_lin <- hnp(rci_lin, scale = TRUE, plot.sim = FALSE, how.many.out = TRUE)$out/length(rci_lin)
+  norm_logis <- hnp(rci_logis, scale = TRUE, plot.sim = FALSE, how.many.out = TRUE)$out/length(rci_logis)
+  
+  return(list("norm_lin" = norm_lin,
+              "norm_logis" = norm_logis))
+}
+
+## function to calculate % points outside of hnp
+hnp_perc <- function(fit) {
+  hnp_lin <- hnp(fit$lin, plot.sim = FALSE, how.many.out = TRUE)$out/nrow(fit$lin$model) * 100
+  hnp_logis <- hnp(fit$logis, plot.sim = FALSE, how.many.out = TRUE)$out/length(fit$logis$y) * 100
+  return(list("lin" = hnp_lin,
+              "logis" = hnp_logis))
+}
+
+## function to get CI coverage
+coverage <- function(fit, true_par = list("lin" = lin_coef,
+                                          "logis" = logis_coef)) {
+  lin_est <- coef(fit$lin)
+  logis_est <- coef(fit$logis)
+  lin_se <- get_se(fit$lin)
+  logis_se <- get_se(fit$logis)
+  
+  lin_90 <- list("upper" = lin_est + qnorm(.95) * lin_se,
+                 "lower" = lin_est - qnorm(.95) * lin_se)
+  lin_95 <- list("upper" = lin_est + qnorm(.975) * lin_se,
+                 "lower" = lin_est - qnorm(.975) * lin_se)
+  lin_99 <- list("upper" = lin_est + qnorm(.995) * lin_se,
+                 "lower" = lin_est - qnorm(.995) * lin_se)
+  logis_90 <- list("upper" = logis_est + qnorm(.95) * logis_se,
+                   "lower" = logis_est - qnorm(.95) * logis_se)
+  logis_95 <- list("upper" = logis_est + qnorm(.975) * logis_se,
+                   "lower" = logis_est - qnorm(.975) * logis_se)
+  logis_99 <- list("upper" = logis_est + qnorm(.995) * logis_se,
+                   "lower" = logis_est - qnorm(.995) * logis_se)
+  
+  cover_lin90 <- (true_par$lin < lin_90$upper) & (true_par$lin > lin_90$lower)
+  cover_lin95 <- (true_par$lin < lin_95$upper) & (true_par$lin > lin_95$lower)
+  cover_lin99 <- (true_par$lin < lin_99$upper) & (true_par$lin > lin_99$lower)
+  cover_logis90 <- (true_par$logis < logis_90$upper) & (true_par$logis > logis_90$lower)
+  cover_logis95 <- (true_par$logis < logis_95$upper) & (true_par$logis > logis_95$lower)
+  cover_logis99 <- (true_par$logis < logis_99$upper) & (true_par$logis > logis_99$lower)
+  
+  return(list("lin90" = cover_lin90,
+              "lin95" = cover_lin95,
+              "lin99" = cover_lin99,
+              "logis90" = cover_logis90,
+              "logis95" = cover_logis95,
+              "logis99" = cover_logis99))
+}
+```
+
+```{r, echo = FALSE, eval = FALSE}
+## simulating 1000 datasets of different sample sizes
+sample_sizes <- c(10,20,30,40,50,100,150,200,250,500,750,1000)
+
+TOTAL_SIM <- 1000
+
+set.seed(2021)
+all_data <- lapply(sample_sizes, function(x) lapply(rep(x, TOTAL_SIM), sample_adni))
+```
+
+*WARNING:* The next code chunk takes around 8 hours to run on a 1.2GHz Quad-Core Intel Core i7 processor
+
+```{r, echo = FALSE, eval = FALSE}
+## fitting the two models to each simulated dataset
+all_models <- lapply(all_data, function(x) lapply(x, fit_both))
+
+## significance of the effects in the linear predictor
+all_signif <- lapply(all_models, function(x) lapply(x, signif))
+
+## normality of the regression based RCI (based on the Shapiro-Wilk test)
+## number of individuals for which reliable change is detected
+## overlap between reliable change detected using linear vs. logistic regression
+all_rci_stats_0.05 <- lapply(all_models, function(x) lapply(x, rci_stats, the_quantile = qnorm(0.05)))
+all_rci_stats_0.025 <- lapply(all_models, function(x) lapply(x, rci_stats, the_quantile = qnorm(0.025)))
+all_rci_stats_0.005 <- lapply(all_models, function(x) lapply(x, rci_stats, the_quantile = qnorm(0.005)))
+
+all_rci_hnp_stats <- lapply(all_models, function(x) lapply(x, rci_hnp_stats))
+
+## percentage of points outside the envelope of the half-normal plot of the residuals
+all_hnp_perc <- lapply(all_models, function(x) lapply(x, hnp_perc))
+
+## percentage coverage of the 90%, 95% and 99% CI for each true parameter value
+all_coverage <- lapply(all_models, function(x) lapply(x, coverage))
+```
+
+```{r, echo = FALSE}
+## getting summaries
+LIN_SIGNIF <- lapply(all_signif, function(x) sapply(x, function(y) y$lin)) %>%
+  lapply(function(x) apply(x, 1, sum)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+LOGIS_SIGNIF <- lapply(all_signif, function(x) sapply(x, function(y) y$logis)) %>%
+  lapply(function(x) apply(x, 1, sum)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+
+LIN_RCI_NORM_HNP <- lapply(all_rci_hnp_stats, function(x) sapply(x, function(y) y$norm_lin)) %>%
+  lapply(function(x) mean(x * 100)) %>%
+  sapply(function(x) x)
+LOGIS_RCI_NORM_HNP <- lapply(all_rci_hnp_stats, function(x) sapply(x, function(y) y$norm_logis)) %>%
+  lapply(function(x) mean(x * 100)) %>%
+  sapply(function(x) x)
+
+LIN_RCI_NORM_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$norm_lin)) %>%
+  lapply(function(x) sum(x)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+LOGIS_RCI_NORM_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$norm_logis)) %>%
+  lapply(function(x) sum(x)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+
+LIN_RCI_N_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$n_lin)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+LOGIS_RCI_N_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$n_logis)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+OVERLAP_RCI_N_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$n_overlap)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+
+LIN_RCI_CORRECT_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$n_correct_lin/y$n_expected_lin * 100)) %>%
+  lapply(function(x) {x[is.na(x)] <- 100; return(x)}) %>%
+  lapply(function(x) mean(x)) %>%
+  sapply(function(x) x)
+LOGIS_RCI_CORRECT_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$n_correct_logis/y$n_expected_logis * 100)) %>%
+  lapply(function(x) {x[is.na(x)] <- 100; return(x)}) %>%
+  lapply(function(x) mean(x)) %>%
+  sapply(function(x) x)
+
+LIN_RCI_TPR_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$TPR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_TNR_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$TNR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_FPR_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$FPR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_FNR_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$FNR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_ACC_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$acc_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_TPR_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$TPR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_TNR_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$TNR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_FPR_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$FPR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_FNR_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$FNR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_ACC_0.05 <- lapply(all_rci_stats_0.05, function(x) sapply(x, function(y) y$acc_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+
+LIN_RCI_NORM_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$norm_lin)) %>%
+  lapply(function(x) sum(x)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+LOGIS_RCI_NORM_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$norm_logis)) %>%
+  lapply(function(x) sum(x)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+
+LIN_RCI_N_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$n_lin)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+LOGIS_RCI_N_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$n_logis)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+OVERLAP_RCI_N_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$n_overlap)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+
+LIN_RCI_CORRECT_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$n_correct_lin/y$n_expected_lin * 100)) %>%
+  lapply(function(x) {x[is.na(x)] <- 100; return(x)}) %>%
+  lapply(function(x) mean(x)) %>%
+  sapply(function(x) x)
+LOGIS_RCI_CORRECT_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$n_correct_logis/y$n_expected_logis * 100)) %>%
+  lapply(function(x) {x[is.na(x)] <- 100; return(x)}) %>%
+  lapply(function(x) mean(x)) %>%
+  sapply(function(x) x)
+
+LIN_RCI_TPR_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$TPR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_TNR_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$TNR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_FPR_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$FPR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_FNR_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$FNR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_ACC_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$acc_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_TPR_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$TPR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_TNR_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$TNR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_FPR_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$FPR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_FNR_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$FNR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_ACC_0.025 <- lapply(all_rci_stats_0.025, function(x) sapply(x, function(y) y$acc_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+
+LIN_RCI_NORM_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$norm_lin)) %>%
+  lapply(function(x) sum(x)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+LOGIS_RCI_NORM_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$norm_logis)) %>%
+  lapply(function(x) sum(x)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+
+LIN_RCI_N_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$n_lin)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+LOGIS_RCI_N_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$n_logis)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+OVERLAP_RCI_N_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$n_overlap)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+
+LIN_RCI_CORRECT_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$n_correct_lin/y$n_expected_lin * 100)) %>%
+  lapply(function(x) {x[is.na(x)] <- 100; return(x)}) %>%
+  lapply(function(x) mean(x)) %>%
+  sapply(function(x) x)
+LOGIS_RCI_CORRECT_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$n_correct_logis/y$n_expected_logis * 100)) %>%
+  lapply(function(x) {x[is.na(x)] <- 100; return(x)}) %>%
+  lapply(function(x) mean(x)) %>%
+  sapply(function(x) x)
+
+LIN_RCI_TPR_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$TPR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_TNR_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$TNR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_FPR_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$FPR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_FNR_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$FNR_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LIN_RCI_ACC_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$acc_lin * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_TPR_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$TPR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_TNR_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$TNR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_FPR_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$FPR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_FNR_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$FNR_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+LOGIS_RCI_ACC_0.005 <- lapply(all_rci_stats_0.005, function(x) sapply(x, function(y) y$acc_logis * 100)) %>%
+  sapply(function(x) x) %>%
+  colMeans()
+
+LIN_HNP_PERC <- lapply(all_hnp_perc, function(x) sapply(x, function(y) y$lin)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+LOGIS_HNP_PERC <- lapply(all_hnp_perc, function(x) sapply(x, function(y) y$logis)) %>%
+  lapply(mean) %>%
+  sapply(function(x) x)
+
+LIN_COVER90 <- lapply(all_coverage, function(x) sapply(x, function(y) y$lin90)) %>%
+  lapply(function(x) apply(x, 1, sum)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+LIN_COVER95 <- lapply(all_coverage, function(x) sapply(x, function(y) y$lin95)) %>%
+  lapply(function(x) apply(x, 1, sum)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+LIN_COVER99 <- lapply(all_coverage, function(x) sapply(x, function(y) y$lin99)) %>%
+  lapply(function(x) apply(x, 1, sum)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+LOGIS_COVER90 <- lapply(all_coverage, function(x) sapply(x, function(y) y$logis90)) %>%
+  lapply(function(x) apply(x, 1, sum)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+LOGIS_COVER95 <- lapply(all_coverage, function(x) sapply(x, function(y) y$logis95)) %>%
+  lapply(function(x) apply(x, 1, sum)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+LOGIS_COVER99 <- lapply(all_coverage, function(x) sapply(x, function(y) y$logis99)) %>%
+  lapply(function(x) apply(x, 1, sum)/TOTAL_SIM * 100) %>%
+  sapply(function(x) x)
+```
+
+## Results
+
+### Significance of F-tests for model effects
+
+```{r, echo = FALSE}
+LIN_SIGNIF <- as.data.frame(LIN_SIGNIF)
+names(LIN_SIGNIF) <- sample_sizes
+LIN_SIGNIF$coef <- c("baseline","age","education","gender")
+
+LOGIS_SIGNIF <- as.data.frame(LOGIS_SIGNIF)
+names(LOGIS_SIGNIF) <- sample_sizes
+LOGIS_SIGNIF$coef <- c("baseline","age","education","gender")
+
+lin_signif <- LIN_SIGNIF %>%
+  pivot_longer(1:12, names_to = "sample_size", values_to = "percentage")
+lin_signif$sample_size <- as.numeric(lin_signif$sample_size)
+
+logis_signif <- LOGIS_SIGNIF %>%
+  pivot_longer(1:12, names_to = "sample_size", values_to = "percentage")
+logis_signif$sample_size <- as.numeric(logis_signif$sample_size)
+
+summary_signif <- left_join(lin_signif, logis_signif, by = c("coef","sample_size"))
+names(summary_signif)[3:4] <- c("linear","logistic")
+summary_signif$sample_size2 <- rep(1:12, 4)
+
+summary_signif %>%
+  pivot_longer(3:4, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  facet_wrap(~ coef) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Percentage of p-value < 0.05") +
+  ggtitle("Significance of F-test")
+```
+
+### Coverage rate of confidence intervals for true population parameters
+
+```{r, echo = FALSE}
+LIN_COVER90 <- as.data.frame(LIN_COVER90)
+names(LIN_COVER90) <- sample_sizes
+LIN_COVER90$coef <- c("intercept","baseline","age","education","gender")
+
+LOGIS_COVER90 <- as.data.frame(LOGIS_COVER90)
+names(LOGIS_COVER90) <- sample_sizes
+LOGIS_COVER90$coef <- c("intercept","baseline","age","education","gender")
+
+lin_cover90 <- LIN_COVER90 %>%
+  pivot_longer(1:12, names_to = "sample_size", values_to = "percentage")
+lin_cover90$sample_size <- as.numeric(lin_cover90$sample_size)
+
+logis_cover90 <- LOGIS_COVER90 %>%
+  pivot_longer(1:12, names_to = "sample_size", values_to = "percentage")
+logis_cover90$sample_size <- as.numeric(logis_cover90$sample_size)
+
+summary_cover90 <- left_join(lin_cover90, logis_cover90, by = c("coef","sample_size"))
+names(summary_cover90)[3:4] <- c("linear","logistic")
+summary_cover90$sample_size2 <- rep(1:12, 5)
+
+summary_cover90 %>%
+  pivot_longer(3:4, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  facet_wrap(~ coef) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Coverage rate (%)") +
+  ggtitle("Coverage of 90% CI") +
+  geom_hline(yintercept = 90, lty = 2)
+```
+
+```{r, echo = FALSE}
+LIN_COVER95 <- as.data.frame(LIN_COVER95)
+names(LIN_COVER95) <- sample_sizes
+LIN_COVER95$coef <- c("intercept","baseline","age","education","gender")
+
+LOGIS_COVER95 <- as.data.frame(LOGIS_COVER95)
+names(LOGIS_COVER95) <- sample_sizes
+LOGIS_COVER95$coef <- c("intercept","baseline","age","education","gender")
+
+lin_cover95 <- LIN_COVER95 %>%
+  pivot_longer(1:12, names_to = "sample_size", values_to = "percentage")
+lin_cover95$sample_size <- as.numeric(lin_cover95$sample_size)
+
+logis_cover95 <- LOGIS_COVER95 %>%
+  pivot_longer(1:12, names_to = "sample_size", values_to = "percentage")
+logis_cover95$sample_size <- as.numeric(logis_cover95$sample_size)
+
+summary_cover95 <- left_join(lin_cover95, logis_cover95, by = c("coef","sample_size"))
+names(summary_cover95)[3:4] <- c("linear","logistic")
+summary_cover95$sample_size2 <- rep(1:12, 5)
+
+summary_cover95 %>%
+  pivot_longer(3:4, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  facet_wrap(~ coef) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Coverage rate (%)") +
+  ggtitle("Coverage of 95% CI") +
+  geom_hline(yintercept = 95, lty = 2)
+```
+
+```{r, echo = FALSE}
+LIN_COVER99 <- as.data.frame(LIN_COVER99)
+names(LIN_COVER99) <- sample_sizes
+LIN_COVER99$coef <- c("intercept","baseline","age","education","gender")
+
+LOGIS_COVER99 <- as.data.frame(LOGIS_COVER99)
+names(LOGIS_COVER99) <- sample_sizes
+LOGIS_COVER99$coef <- c("intercept","baseline","age","education","gender")
+
+lin_cover99 <- LIN_COVER99 %>%
+  pivot_longer(1:12, names_to = "sample_size", values_to = "percentage")
+lin_cover99$sample_size <- as.numeric(lin_cover99$sample_size)
+
+logis_cover99 <- LOGIS_COVER99 %>%
+  pivot_longer(1:12, names_to = "sample_size", values_to = "percentage")
+logis_cover99$sample_size <- as.numeric(logis_cover99$sample_size)
+
+summary_cover99 <- left_join(lin_cover99, logis_cover99, by = c("coef","sample_size"))
+names(summary_cover99)[3:4] <- c("linear","logistic")
+summary_cover99$sample_size2 <- rep(1:12, 5)
+
+summary_cover99 %>%
+  pivot_longer(3:4, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  facet_wrap(~ coef) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Coverage rate (%)") +
+  ggtitle("Coverage of 99% CI") +
+  geom_hline(yintercept = 99, lty = 2)
+```
+
+### Goodness-of-fit
+
+```{r, echo = FALSE}
+names(LIN_HNP_PERC) <- sample_sizes
+names(LOGIS_HNP_PERC) <- sample_sizes
+
+summary_hnp <- tibble("linear" = LIN_HNP_PERC,
+                      "logistic" = LOGIS_HNP_PERC,
+                      "sample_size" = sample_sizes,
+                      "sample_size2" = 1:12)
+
+summary_hnp %>%
+  pivot_longer(1:2, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  geom_hline(yintercept = 5, lty = 2) +
+  xlab("Sample size") +
+  ylab("Mean percentage") +
+  ggtitle("Mean percentage of points outside simulated envelope")
+```
+
+## RCI results
+
+### Normality of RCI (based on half-normal plot with simulated envelope)
+
+```{r, echo = FALSE}
+names(LIN_RCI_NORM_HNP) <- sample_sizes
+names(LOGIS_RCI_NORM_HNP) <- sample_sizes
+
+summary_rci_hnp <- tibble("linear" = LIN_RCI_NORM_HNP,
+                          "logistic" = LOGIS_RCI_NORM_HNP,
+                          "sample_size" = sample_sizes,
+                          "sample_size2" = 1:12)
+
+summary_rci_hnp %>%
+  pivot_longer(1:2, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Mean percentage of points outside envelope") +
+  ggtitle("Normality of RCI based on half-normal plot")
+```
+
+### Percentage of correctly-identified reliable change points
+
+```{r, echo = FALSE}
+names(LIN_RCI_CORRECT_0.005) <- sample_sizes
+names(LOGIS_RCI_CORRECT_0.005) <- sample_sizes
+
+summary_rci_correct_0.005 <- tibble("linear" = LIN_RCI_CORRECT_0.005,
+                                    "logistic" = LOGIS_RCI_CORRECT_0.005,
+                                    "sample_size" = sample_sizes,
+                                    "sample_size2" = 1:12,
+                                    "threshold" = rep(qnorm(0.005) %>% round(2), 12))
+
+names(LIN_RCI_CORRECT_0.025) <- sample_sizes
+names(LOGIS_RCI_CORRECT_0.025) <- sample_sizes
+
+summary_rci_correct_0.025 <- tibble("linear" = LIN_RCI_CORRECT_0.025,
+                                    "logistic" = LOGIS_RCI_CORRECT_0.025,
+                                    "sample_size" = sample_sizes,
+                                    "sample_size2" = 1:12,
+                                    "threshold" = rep(qnorm(0.025) %>% round(2), 12))
+
+names(LIN_RCI_CORRECT_0.05) <- sample_sizes
+names(LOGIS_RCI_CORRECT_0.05) <- sample_sizes
+
+summary_rci_correct_0.05 <- tibble("linear" = LIN_RCI_CORRECT_0.05,
+                                   "logistic" = LOGIS_RCI_CORRECT_0.05,
+                                   "sample_size" = sample_sizes,
+                                   "sample_size2" = 1:12,
+                                   "threshold" = rep(qnorm(0.05) %>% round(2), 12))
+
+summary_rci_correct <- rbind(summary_rci_correct_0.005,
+                             summary_rci_correct_0.025,
+                             summary_rci_correct_0.05)
+
+summary_rci_correct %>%
+  pivot_longer(1:2, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Mean percentage") +
+  facet_wrap(~ threshold) +
+  ggtitle("Mean percentage of correctly identified reliable change points")
+```
+
+### True Positive Rates
+
+```{r, echo = FALSE}
+names(LIN_RCI_TPR_0.005) <- sample_sizes
+names(LOGIS_RCI_TPR_0.005) <- sample_sizes
+
+summary_rci_TPR_0.005 <- tibble("linear" = LIN_RCI_TPR_0.005,
+                                "logistic" = LOGIS_RCI_TPR_0.005,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.005) %>% round(2), 12))
+
+names(LIN_RCI_TPR_0.025) <- sample_sizes
+names(LOGIS_RCI_TPR_0.025) <- sample_sizes
+
+summary_rci_TPR_0.025 <- tibble("linear" = LIN_RCI_TPR_0.025,
+                                "logistic" = LOGIS_RCI_TPR_0.025,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.025) %>% round(2), 12))
+
+names(LIN_RCI_TPR_0.05) <- sample_sizes
+names(LOGIS_RCI_TPR_0.05) <- sample_sizes
+
+summary_rci_TPR_0.05 <- tibble("linear" = LIN_RCI_TPR_0.05,
+                               "logistic" = LOGIS_RCI_TPR_0.05,
+                               "sample_size" = sample_sizes,
+                               "sample_size2" = 1:12,
+                               "threshold" = rep(qnorm(0.05) %>% round(2), 12))
+
+summary_rci_TPR <- rbind(summary_rci_TPR_0.005,
+                         summary_rci_TPR_0.025,
+                         summary_rci_TPR_0.05)
+
+summary_rci_TPR %>%
+  pivot_longer(1:2, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Mean percentage") +
+  facet_wrap(~ threshold) +
+  ggtitle("Mean True Positive Rate") +
+  ylim(0,100)
+```
+
+### True Negative Rates
+
+```{r, echo = FALSE}
+names(LIN_RCI_TNR_0.005) <- sample_sizes
+names(LOGIS_RCI_TNR_0.005) <- sample_sizes
+
+summary_rci_TNR_0.005 <- tibble("linear" = LIN_RCI_TNR_0.005,
+                                "logistic" = LOGIS_RCI_TNR_0.005,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.005) %>% round(2), 12))
+
+names(LIN_RCI_TNR_0.025) <- sample_sizes
+names(LOGIS_RCI_TNR_0.025) <- sample_sizes
+
+summary_rci_TNR_0.025 <- tibble("linear" = LIN_RCI_TNR_0.025,
+                                "logistic" = LOGIS_RCI_TNR_0.025,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.025) %>% round(2), 12))
+
+names(LIN_RCI_TNR_0.05) <- sample_sizes
+names(LOGIS_RCI_TNR_0.05) <- sample_sizes
+
+summary_rci_TNR_0.05 <- tibble("linear" = LIN_RCI_TNR_0.05,
+                               "logistic" = LOGIS_RCI_TNR_0.05,
+                               "sample_size" = sample_sizes,
+                               "sample_size2" = 1:12,
+                               "threshold" = rep(qnorm(0.05) %>% round(2), 12))
+
+summary_rci_TNR <- rbind(summary_rci_TNR_0.005,
+                         summary_rci_TNR_0.025,
+                         summary_rci_TNR_0.05)
+
+summary_rci_TNR %>%
+  pivot_longer(1:2, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Mean percentage") +
+  facet_wrap(~ threshold) +
+  ggtitle("Mean True Negative Rate") +
+  ylim(0,100)
+```
+
+### False Negative Rates
+
+```{r, echo = FALSE}
+names(LIN_RCI_FNR_0.005) <- sample_sizes
+names(LOGIS_RCI_FNR_0.005) <- sample_sizes
+
+summary_rci_FNR_0.005 <- tibble("linear" = LIN_RCI_FNR_0.005,
+                                "logistic" = LOGIS_RCI_FNR_0.005,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.005) %>% round(2), 12))
+
+names(LIN_RCI_FNR_0.025) <- sample_sizes
+names(LOGIS_RCI_FNR_0.025) <- sample_sizes
+
+summary_rci_FNR_0.025 <- tibble("linear" = LIN_RCI_FNR_0.025,
+                                "logistic" = LOGIS_RCI_FNR_0.025,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.025) %>% round(2), 12))
+
+names(LIN_RCI_FNR_0.05) <- sample_sizes
+names(LOGIS_RCI_FNR_0.05) <- sample_sizes
+
+summary_rci_FNR_0.05 <- tibble("linear" = LIN_RCI_FNR_0.05,
+                               "logistic" = LOGIS_RCI_FNR_0.05,
+                               "sample_size" = sample_sizes,
+                               "sample_size2" = 1:12,
+                               "threshold" = rep(qnorm(0.05) %>% round(2), 12))
+
+summary_rci_FNR <- rbind(summary_rci_FNR_0.005,
+                         summary_rci_FNR_0.025,
+                         summary_rci_FNR_0.05)
+
+summary_rci_FNR %>%
+  pivot_longer(1:2, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Mean percentage") +
+  facet_wrap(~ threshold) +
+  ylim(0,100) +
+  ggtitle("Mean False Negative Rate")
+```
+
+### Accuracy
+
+```{r, echo = FALSE}
+names(LIN_RCI_ACC_0.005) <- sample_sizes
+names(LOGIS_RCI_ACC_0.005) <- sample_sizes
+
+summary_rci_ACC_0.005 <- tibble("linear" = LIN_RCI_ACC_0.005,
+                                "logistic" = LOGIS_RCI_ACC_0.005,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.005) %>% round(2), 12))
+
+names(LIN_RCI_ACC_0.025) <- sample_sizes
+names(LOGIS_RCI_ACC_0.025) <- sample_sizes
+
+summary_rci_ACC_0.025 <- tibble("linear" = LIN_RCI_ACC_0.025,
+                                "logistic" = LOGIS_RCI_ACC_0.025,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.025) %>% round(2), 12))
+
+names(LIN_RCI_ACC_0.05) <- sample_sizes
+names(LOGIS_RCI_ACC_0.05) <- sample_sizes
+
+summary_rci_ACC_0.05 <- tibble("linear" = LIN_RCI_ACC_0.05,
+                               "logistic" = LOGIS_RCI_ACC_0.05,
+                               "sample_size" = sample_sizes,
+                               "sample_size2" = 1:12,
+                               "threshold" = rep(qnorm(0.05) %>% round(2), 12))
+
+summary_rci_ACC <- rbind(summary_rci_ACC_0.005,
+                         summary_rci_ACC_0.025,
+                         summary_rci_ACC_0.05)
+
+summary_rci_ACC %>%
+  pivot_longer(1:2, names_to = "model", values_to = "percentage") %>%
+  ggplot(aes(x = sample_size2, y = percentage, col = model)) +
+  theme_bw() +
+  geom_point(alpha = .8) +
+  geom_line(alpha = .8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
+  xlab("Sample size") +
+  ylab("Mean percentage") +
+  facet_wrap(~ threshold) +
+  ggtitle("Mean Accuracy") +
+  ylim(90,100)
+```
+
+```{r, echo = FALSE}
+# gathering data on FPR
+names(LIN_RCI_FPR_0.005) <- sample_sizes
+names(LOGIS_RCI_FPR_0.005) <- sample_sizes
+
+summary_rci_FPR_0.005 <- tibble("linear" = LIN_RCI_FPR_0.005,
+                                "logistic" = LOGIS_RCI_FPR_0.005,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.005) %>% round(2), 12))
+
+names(LIN_RCI_FPR_0.025) <- sample_sizes
+names(LOGIS_RCI_FPR_0.025) <- sample_sizes
+
+summary_rci_FPR_0.025 <- tibble("linear" = LIN_RCI_FPR_0.025,
+                                "logistic" = LOGIS_RCI_FPR_0.025,
+                                "sample_size" = sample_sizes,
+                                "sample_size2" = 1:12,
+                                "threshold" = rep(qnorm(0.025) %>% round(2), 12))
+
+names(LIN_RCI_FPR_0.05) <- sample_sizes
+names(LOGIS_RCI_FPR_0.05) <- sample_sizes
+
+summary_rci_FPR_0.05 <- tibble("linear" = LIN_RCI_FPR_0.05,
+                               "logistic" = LOGIS_RCI_FPR_0.05,
+                               "sample_size" = sample_sizes,
+                               "sample_size2" = 1:12,
+                               "threshold" = rep(qnorm(0.05) %>% round(2), 12))
+
+summary_rci_FPR <- rbind(summary_rci_FPR_0.005,
+                         summary_rci_FPR_0.025,
+                         summary_rci_FPR_0.05)
+```
+
+*WARNING:* The resulting .RData is approximately 1.28GB in size. Delete the code chunk below if you would not like to save the results.
+
+```{r, echo = FALSE}
+save.image("results_new_simulation_final.RData")
+```
