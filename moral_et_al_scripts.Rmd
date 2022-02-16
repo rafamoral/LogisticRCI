@@ -1,5 +1,5 @@
 ---
-title: "Logistic versus linear regression-based Reliable Change Index: Implications for clinical studies with diverse sample sizes"
+title: "Logistic versus linear regression-based Reliable Change Index: a simulation study with implications for clinical studies with different sample sizes"
 author:
   - Rafael A. Moral
   - Unai Diaz-Orueta
