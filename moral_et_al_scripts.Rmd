@@ -26,12 +26,15 @@ adni$AVLT_DEL_BL <- as.numeric(adni$AVLT_DEL_BL)
 adni$AVLT_DEL_6M <- as.numeric(adni$AVLT_DEL_6M)
 
 adni <- adni %>%
-  dplyr::select(AGE, PTEDUCAT, PTGENDER, AVLT_DEL_6M, AVLT_DEL_BL)
+  filter(VISCODE == 0)
+
+adni <- adni %>%
+  dplyr::select(AGE, PTEDUCAT, PTGENDER, AVLT_DEL_6M, AVLT_DEL_BL, DX_bl, RID)
 
 adni <- adni %>%
   filter(AVLT_DEL_6M > 0 & AVLT_DEL_BL > 0)
 
-names(adni) <- c("age","education","gender","score","baseline")
+names(adni) <- c("age","education","gender","score","baseline","MCI","RID")
 adni$gender <- as.factor(adni$gender)
 levels(adni$gender) <- c("male","female") ## assuming 0 = male and 1 = female
 
@@ -98,6 +101,16 @@ We start by fitting the models to the ADNI dataset:
 ```{r}
 fit_linear <- lm(score ~ baseline + age + education + gender, data = adni)
 fit_logistic <- glm(cbind(score, 15 - score) ~ baseline + age + education + gender, family = quasibinomial, data = adni)
+```
+
+```{r, echo = FALSE}
+## final ADNI dataset used to create the simulations
+adni_final <- adni %>%
+  mutate(linear_rci = RCI(fit_linear),
+         logistic_rci = RCI(fit_logistic),
+         decline_linear = (linear_rci < -1.64) %>% as.numeric,
+         decline_logistic = (logistic_rci < -1.64) %>% as.numeric)
+write_csv(x = adni_final, path = "adni_final.csv")
 ```
 
 The ANOVA table for the linear regression model:

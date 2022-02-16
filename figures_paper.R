@@ -1,5 +1,9 @@
-# Moral, Oltra-Cucarella, Diaz-Orueta
-# Scripts for reproducing the figures in the paper
+# Logistic versus linear regression-based Reliable Change Index:
+# a simulation study with implications for clinical studies with
+# different sample sizes
+# Authors: Rafael Moral, Unai Diaz-Orueta, Javier Oltra-Cucarella
+
+# Scripts to reproduce the figures in the paper
 
 library(tidyverse)
 library(ggplot2)
@@ -26,6 +30,15 @@ fplot
 dev.off()
 
 ## TPR and TNR and ACC
+summary_rci_TPR$threshold2 <- as.factor(summary_rci_TPR$threshold)
+levels(summary_rci_TPR$threshold2) <- c("5%ile (one tailed)","10%ile (one tailed)","15%ile (one tailed)")
+
+summary_rci_TNR$threshold2 <- as.factor(summary_rci_TNR$threshold)
+levels(summary_rci_TNR$threshold2) <- c("5%ile (one tailed)","10%ile (one tailed)","15%ile (one tailed)")
+
+summary_rci_ACC$threshold2 <- as.factor(summary_rci_ACC$threshold)
+levels(summary_rci_ACC$threshold2) <- c("5%ile (one tailed)","10%ile (one tailed)","15%ile (one tailed)")
+
 tpr <- summary_rci_TPR %>%
   pivot_longer(1:2, names_to = "model", values_to = "percentage") %>%
   ggplot(aes(x = sample_size2, y = percentage, col = model)) +
@@ -36,7 +49,7 @@ tpr <- summary_rci_TPR %>%
   scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
   xlab("Sample size") +
   ylab("Mean TPR (%)") +
-  facet_wrap(~ threshold) +
+  facet_wrap(~ threshold2) +
   ggtitle("True Positive Rate") +
   ylim(60,100)
 
@@ -50,7 +63,7 @@ tnr <- summary_rci_TNR %>%
   scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
   xlab("Sample size") +
   ylab("Mean TNR (%)") +
-  facet_wrap(~ threshold) +
+  facet_wrap(~ threshold2) +
   ggtitle("True Negative Rate") +
   ylim(60,100)
 
@@ -64,7 +77,7 @@ acc <- summary_rci_ACC %>%
   scale_x_continuous(breaks = 1:12, labels = sample_sizes) +
   xlab("Sample size") +
   ylab("Mean accuracy (%)") +
-  facet_wrap(~ threshold) +
+  facet_wrap(~ threshold2) +
   ggtitle("Accuracy") +
   ylim(60,100)
 
